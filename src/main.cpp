@@ -14,14 +14,18 @@ PubSubClient client(espClient);
 #define COOLING  55
 #define SPARKING 120
 
-CRGB* m_buffer;
+CRGB m_buffer[NUM_PIXELS];
 CRGB m_current = CRGB::White;
-String mode = "";
+char mode[16] = "";
 byte counter;
+unsigned long reconnectStartMs = 0;
+unsigned long lastReconnectTryMs = 0;
+const unsigned long RECONNECT_TIMEOUT_MS = 300000;
+const unsigned long RECONNECT_INTERVAL_MS = 5000;
 
 void setupMqtt();
 void callback(char* topic, byte* payload, unsigned int length);
-void reconnect();
+bool reconnect();
 void setColor(CRGB color);
 
 void setup() {
@@ -46,7 +50,6 @@ void setup() {
 
   espClient.setCACert(ca_cert);
 
-  m_buffer = new CRGB[NUM_PIXELS];
   FastLED.addLeds<WS2812, DATA_PIN, GRB>(m_buffer, NUM_PIXELS);
   FastLED.addLeds<WS2812, SYS_LED, RGB>(m_buffer, 1);
   FastLED.clear();
@@ -55,35 +58,36 @@ void setup() {
 }
 
 void loop() {
-  if (!client.connected()) {
+  if (WiFi.status() != WL_CONNECTED || !client.connected()) {
     reconnect();
+  } else {
+    client.loop();
   }
-  client.loop();
 
-  if (mode == "party") {
+  if (strcmp(mode, "party") == 0) {
     for (int i = 0; i < NUM_PIXELS; i++ ) {         // от 0 до первой трети
       m_buffer[i] = CHSV(counter + i * 2, 255, 255);  // HSV. Увеличивать HUE (цвет)
-    // умножение i уменьшает шаг радуги
+    // умножение i уменьшает шаг радууги
     }
     counter++;        // counter меняется от 0 до 255 (тип данных byte)
     FastLED.show();
     delay(5);
-  } else if (mode == "neon") {
+  } else if (strcmp(mode, "neon") == 0) {
     for (int i = 0; i < 256; i++) {
       client.loop();
-      if (mode != "neon") break;
+      if (strcmp(mode, "neon") != 0) break;
       FastLED.setBrightness(i);
       FastLED.show();
       delay(5);
     }
     for (int i = 255; i >= 0; i--) {
       client.loop();
-      if (mode != "neon") break;
+      if (strcmp(mode, "neon") != 0) break;
       FastLED.setBrightness(i);
       FastLED.show();
       delay(5);
     }
-  } else if (mode == "candle") {
+  } else if (strcmp(mode, "candle") == 0) {
     
   }
   
@@ -101,65 +105,55 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print(topic);
   Serial.print("] ");
 
-  for (int i=0;i<length;i++) {
+  for (unsigned int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
   }
   Serial.println();
 
   int pos = 0;
-  String command = "";
-  for (int i=0;i<length;i++) {
+  char command[16] = "";
+  for (unsigned int i = 0; i < length && pos < (int)sizeof(command) - 1; i++) {
     if ((char)payload[i] == '=')
       break;
-    command += (char)payload[i];
-    pos++;
+    command[pos++] = (char)payload[i];
   }
+  command[pos] = '\0';
 
-  if (command == "1") {
-    digitalWrite(BUILTIN_LED, LOW);   
+  if (strcmp(command, "1") == 0) {
+    digitalWrite(BUILTIN_LED, LOW);
     setColor(m_current);
     return;
   }
 
-  if (command == "0") {
-    mode = "";
-    digitalWrite(BUILTIN_LED, HIGH); 
+  if (strcmp(command, "0") == 0) {
+    mode[0] = '\0';
+    digitalWrite(BUILTIN_LED, HIGH);
     setColor(CRGB::Black);
     return;
   }
 
-  if (command == "rgb") {
-    int idx = 0;
-    uint8_t* map = new uint8_t[3];
-    command = "";
-    for (int i=pos + 1;i<length;i++) {
-      if ((char)payload[i] == ':') {
-        map[idx] = (uint8_t)command.toInt();
-        command = "";
-        idx++;
-        continue;
-      }
-
-      command += (char)payload[i];  
+  if (strcmp(command, "rgb") == 0) {
+    int r = 0;
+    int g = 0;
+    int b = 0;
+    if (pos + 1 < (int)length) {
+      sscanf((const char*)payload + pos + 1, "%d:%d:%d", &r, &g, &b);
     }
-    map[idx] = (uint8_t)command.toInt();   
 
-    mode = "";
-
-    m_current.setRGB(map[0],map[1],map[2]);    
+    mode[0] = '\0';
+    m_current.setRGB((uint8_t)r, (uint8_t)g, (uint8_t)b);
     setColor(m_current);
     return;
   }
 
-  if (command == "temp") {
-    command = "";
-    for (int i=pos + 1;i<length;i++) {
-      command += (char)payload[i];
+  if (strcmp(command, "temp") == 0) {
+    int tempHundred = 0;
+    if (pos + 1 < (int)length) {
+      sscanf((const char*)payload + pos + 1, "%d", &tempHundred);
     }
 
-    mode = "";
-
-    float temp = command.toInt() / 100.0;
+    mode[0] = '\0';
+    float temp = tempHundred / 100.0;
     int red = 0;
     int green = 0;
     int blue = 0;
@@ -171,7 +165,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       red = 329.698727446 * pow(red, -0.1332047592);
       if (red < 0) {
         red = 0;
-      } 
+      }
       if (red > 255) {
         red = 255;
       }
@@ -182,7 +176,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       green = 99.4708025861 * log(green) - 161.1195681661;
       if (green < 0) {
         green = 0;
-      } 
+      }
       if (green > 255) {
         green = 255;
       }
@@ -191,7 +185,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       green = 288.1221695283 * pow(green, -0.0755148492);
       if (green < 0) {
         green = 0;
-      } 
+      }
       if (green > 255) {
         green = 255;
       }
@@ -204,7 +198,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       blue = 138.5177312231 * log(blue) - 305.0447927307;
       if (blue < 0) {
         blue = 0;
-      } 
+      }
       if (blue > 255) {
         blue = 255;
       }
@@ -214,25 +208,27 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
 
-  if (command == "brightness") {
-    command = "";
-    for (int i=pos + 1;i<length;i++) {
-      command += (char)payload[i];
+  if (strcmp(command, "brightness") == 0) {
+    int brightness = 0;
+    if (pos + 1 < (int)length) {
+      sscanf((const char*)payload + pos + 1, "%d", &brightness);
     }
-    FastLED.setBrightness(command.toInt());
+    FastLED.setBrightness(brightness);
     FastLED.show();
-    FastLED.delay(25); 
+    FastLED.delay(25);
     return;
   }
 
-  if (command == "scene") {
-    command = "";
-    for (int i=pos + 1;i<length;i++) {
-      command += (char)payload[i];
+  if (strcmp(command, "scene") == 0) {
+    unsigned int sceneLen = 0;
+    if (length > (unsigned int)pos + 1) {
+      sceneLen = length - (unsigned int)pos - 1;
+      if (sceneLen >= sizeof(mode)) {
+        sceneLen = sizeof(mode) - 1;
+      }
+      memcpy(mode, payload + pos + 1, sceneLen);
     }
-
-    mode = command;
-
+    mode[sceneLen] = '\0';
     return;
   }
 }
@@ -246,36 +242,66 @@ void setColor(CRGB color) {
   FastLED.delay(25); 
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.println("attempting MQTT connection...");
-
-    String clientId = "strip1";
-    clientId += String(random(0xffff), HEX);
-
-    if (client.connect(clientId.c_str(), username, devicepassword)) {
-      Serial.println("connected");
-      
-      // 
-      if(client.subscribe(commands.c_str(), 1)) {
-        Serial.println("subscribed");
-      }
-      
-      String message = "esp32-led-strip connected [";
-      message += clientId;
-      message += "]";
-      
-      if(client.publish(commands.c_str(), message.c_str())) {
-        Serial.println("published");
-      }
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      
-      // Wait 5 seconds before retrying
-      delay(5000);
+bool reconnect() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (reconnectStartMs == 0) {
+      reconnectStartMs = millis();
+      Serial.println("WiFi disconnected, reconnecting...");
+      WiFi.disconnect();
+      WiFi.reconnect();
+    } else if (millis() - reconnectStartMs > RECONNECT_TIMEOUT_MS) {
+      Serial.println("WiFi reconnect timeout exceeded, rebooting...");
+      ESP.restart();
     }
+    return false;
+  }
+
+  if (client.connected()) {
+    reconnectStartMs = 0;
+    lastReconnectTryMs = 0;
+    return true;
+  }
+
+  if (millis() - lastReconnectTryMs < RECONNECT_INTERVAL_MS) {
+    return false;
+  }
+
+  lastReconnectTryMs = millis();
+  if (reconnectStartMs == 0) {
+    reconnectStartMs = millis();
+  }
+
+  Serial.println("attempting MQTT connection...");
+
+  char clientId[32];
+  snprintf(clientId, sizeof(clientId), "strip1%04x", random(0xffff));
+
+  if (client.connect(clientId, username, devicepassword)) {
+    Serial.println("connected");
+
+    if(client.subscribe(commands.c_str(), 1)) {
+      Serial.println("subscribed");
+    }
+
+    char message[64];
+    snprintf(message, sizeof(message), "esp32-led-strip connected [%s]", clientId);
+
+    if(client.publish(commands.c_str(), message)) {
+      Serial.println("published");
+    }
+
+    reconnectStartMs = 0;
+    lastReconnectTryMs = 0;
+    return true;
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" try again later");
+    if (millis() - reconnectStartMs > RECONNECT_TIMEOUT_MS) {
+      Serial.println("MQTT reconnect timeout exceeded, rebooting...");
+      ESP.restart();
+    }
+    return false;
   }
 }
 
