@@ -1,5 +1,8 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <Update.h>
 #include <PubSubClient.h>
 #include "config.h"
 #include <NeoPixelBus.h>
@@ -11,11 +14,17 @@ PubSubClient client(espClient);
 #define NUM_PIXELS 342
 #define DATA_PIN 5
 #define SYS_LED 10
+#define ENABLE_SYS_LED 0
 
 #define COOLING  55
 #define SPARKING 120
 
 NeoPixelBrightnessBus<NeoGrbFeature, NeoEsp32Rmt0Ws2812xMethod> strip(NUM_PIXELS, DATA_PIN);
+#if ENABLE_SYS_LED
+NeoPixelBrightnessBus<NeoGrbFeature, NeoEsp32Rmt1Ws2812xMethod> sysLed(1, SYS_LED);
+#endif
+WebServer server(80);
+const char* OTA_HOSTNAME = "wxlf-led-strip";
 
 enum SceneMode {
   SceneNone,
@@ -38,8 +47,10 @@ const unsigned long RECONNECT_INTERVAL_MS = 5000;
 const unsigned long SCENE_UPDATE_INTERVAL_MS = 20;
 
 void setupMqtt();
+void setupWebServer();
 void callback(char* topic, byte* payload, unsigned int length);
 bool reconnect();
+void syncSysLed();
 void setColor(const RgbColor& color);
 void setSceneMode(const char* newMode);
 void updateScene();
@@ -122,17 +133,27 @@ void setup() {
   Serial.print("IP Adress: \t");
   Serial.println(WiFi.localIP());
 
+  setupWebServer();
   espClient.setCACert(ca_cert);
 
   strip.Begin();
   strip.SetBrightness(255);
   strip.ClearTo(RgbColor(0, 0, 0));
   strip.Show();
+#if ENABLE_SYS_LED
+  sysLed.Begin();
+  sysLed.SetBrightness(255);
+  sysLed.ClearTo(RgbColor(0, 0, 0));
+  sysLed.Show();
+#endif
+  syncSysLed();
 
   setColor(RgbColor(255, 255, 255));
 }
 
 void loop() {
+  server.handleClient();
+
   if (WiFi.status() != WL_CONNECTED || !client.connected()) {
     reconnect();
   } else {
@@ -192,6 +213,7 @@ void partyScene() {
   }
   counter++;
   strip.Show();
+  syncSysLed();
 }
 
 void neonScene() {
@@ -210,11 +232,146 @@ void neonScene() {
   }
   strip.SetBrightness(neonBrightness);
   strip.Show();
+  syncSysLed();
 }
 
 void candleScene() {
   CandleScene();
   strip.Show();
+  syncSysLed();
+}
+
+void setupWebServer() {
+  server.on("/status", HTTP_GET, []() {
+    String payload = "{\"mac\":\"" + WiFi.macAddress() + "\"}";
+    server.send(200, "application/json", payload);
+  });
+
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 OTA Update</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #111; color: #f5f5f5; margin: 0; padding: 24px; }
+    .card { max-width: 520px; margin: 40px auto; background: #1c1c1c; border-radius: 12px; padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.25); }
+    h1 { margin-top: 0; }
+    input[type="file"] { width: 100%; margin: 12px 0 16px; }
+    button { background: #00bcd4; color: white; border: 0; padding: 10px 16px; border-radius: 8px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .progress { display: none; margin-top: 16px; }
+    .bar { width: 100%; height: 12px; background: #333; border-radius: 999px; overflow: hidden; }
+    .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, #00bcd4, #5eead4); transition: width 0.2s ease; }
+    .status { margin-top: 8px; color: #cfd8dc; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>ESP32 Web OTA</h1>
+    <p>Select a firmware binary file and upload it to update the device.</p>
+    <form id="otaForm" method="POST" action="/update" enctype="multipart/form-data">
+      <input id="firmwareInput" type="file" name="firmware" accept=".bin" required>
+      <button id="uploadButton" type="submit">Upload firmware</button>
+    </form>
+    <div id="progressBox" class="progress">
+      <div class="bar"><div id="progressBar"></div></div>
+      <div id="statusText" class="status">Waiting for upload…</div>
+    </div>
+  </div>
+  <script>
+    const form = document.getElementById('otaForm');
+    const button = document.getElementById('uploadButton');
+    const progressBox = document.getElementById('progressBox');
+    const progressBar = document.getElementById('progressBar');
+    const statusText = document.getElementById('statusText');
+    const firmwareInput = document.getElementById('firmwareInput');
+
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (!firmwareInput.files || firmwareInput.files.length === 0) {
+        statusText.textContent = 'Please select a firmware file first.';
+        return;
+      }
+
+      const file = firmwareInput.files[0];
+      const formData = new FormData(form);
+
+      progressBox.style.display = 'block';
+      progressBar.style.width = '0%';
+      statusText.textContent = 'Uploading ' + file.name + '...';
+      button.disabled = true;
+
+      const xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', function (e) {
+        if (e.lengthComputable) {
+          const percent = Math.round((e.loaded / e.total) * 100);
+          progressBar.style.width = percent + '%';
+          statusText.textContent = 'Uploading ' + file.name + ': ' + percent + '%';
+        }
+      });
+
+      xhr.addEventListener('load', function () {
+        progressBar.style.width = '100%';
+        if (xhr.status >= 200 && xhr.status < 300) {
+          statusText.textContent = xhr.responseText || 'Upload complete. Rebooting...';
+        } else {
+          statusText.textContent = 'Upload failed.';
+        }
+        button.disabled = false;
+      });
+
+      xhr.addEventListener('error', function () {
+        statusText.textContent = 'Upload failed. Please try again.';
+        button.disabled = false;
+      });
+
+      xhr.open('POST', '/update');
+      xhr.send(formData);
+    });
+  </script>
+</body>
+</html>
+)rawliteral");
+  });
+
+  server.on(
+    "/update",
+    HTTP_POST,
+    []() {
+      if (Update.hasError()) {
+        server.send(200, "text/plain", "OTA update failed");
+      } else {
+        server.send(200, "text/plain", "OTA update successful. Rebooting...");
+      }
+    },
+    []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("OTA upload started: %s\n", upload.filename.c_str());
+        size_t fileSize = server.header("X-File-Size").toInt();
+        if (fileSize == 0) fileSize = UPDATE_SIZE_UNKNOWN; 
+        if (!Update.begin(fileSize)) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) {
+          Serial.printf("OTA upload finished: %u bytes\n", upload.totalSize);
+        } else {
+          Update.printError(Serial);
+        }
+      }
+    }
+  );
+
+  server.begin();
+  Serial.println("Web OTA server started");
 }
 
 void setupMqtt() {
@@ -244,14 +401,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
   command[pos] = '\0';
 
   if (strcmp(command, "1") == 0) {
-    digitalWrite(BUILTIN_LED, LOW);
     setColor(m_current);
     return;
   }
 
   if (strcmp(command, "0") == 0) {
     mode[0] = '\0';
-    digitalWrite(BUILTIN_LED, HIGH);
     setColor(RgbColor(0, 0, 0));
     return;
   }
@@ -358,12 +513,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
+void syncSysLed() {
+#if ENABLE_SYS_LED
+  sysLed.SetPixelColor(0, strip.GetPixelColor(0));
+  sysLed.Show();
+#endif
+}
+
 void setColor(const RgbColor& color) {
   for (int i = 0; i < NUM_PIXELS; i++) {
     strip.SetPixelColor(i, color);
   }
   strip.Show();
   delay(25);
+  syncSysLed();
 }
 
 bool reconnect() {
