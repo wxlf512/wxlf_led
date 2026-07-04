@@ -2,7 +2,8 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include "config.h"
-#include <FastLED.h>
+#include <NeoPixelBus.h>
+#include <NeoPixelBrightnessBus.h>
 
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
@@ -14,19 +15,92 @@ PubSubClient client(espClient);
 #define COOLING  55
 #define SPARKING 120
 
-CRGB m_buffer[NUM_PIXELS];
-CRGB m_current = CRGB::White;
+NeoPixelBrightnessBus<NeoGrbFeature, NeoEsp32Rmt0Ws2812xMethod> strip(NUM_PIXELS, DATA_PIN);
+
+enum SceneMode {
+  SceneNone,
+  SceneParty,
+  SceneNeon,
+  SceneCandle,
+};
+
+RgbColor m_current = RgbColor(255, 255, 255);
 char mode[16] = "";
+SceneMode sceneMode = SceneNone;
 byte counter;
+uint8_t neonBrightness = 0;
+bool neonIncreasing = true;
+unsigned long lastSceneUpdateMs = 0;
 unsigned long reconnectStartMs = 0;
 unsigned long lastReconnectTryMs = 0;
 const unsigned long RECONNECT_TIMEOUT_MS = 300000;
 const unsigned long RECONNECT_INTERVAL_MS = 5000;
+const unsigned long SCENE_UPDATE_INTERVAL_MS = 20;
 
 void setupMqtt();
 void callback(char* topic, byte* payload, unsigned int length);
 bool reconnect();
-void setColor(CRGB color);
+void setColor(const RgbColor& color);
+void setSceneMode(const char* newMode);
+void updateScene();
+void partyScene();
+void neonScene();
+void candleScene();
+void CandleScene();
+
+uint8_t qsub8(uint8_t a, uint8_t b) {
+  return (a > b) ? a - b : 0;
+}
+
+uint8_t qadd8(uint8_t a, uint8_t b) {
+  uint16_t sum = (uint16_t)a + (uint16_t)b;
+  return (sum > 255) ? 255 : (uint8_t)sum;
+}
+
+RgbColor hsvToRgb(uint8_t hue, uint8_t sat, uint8_t val) {
+  if (sat == 0) {
+    return RgbColor(val, val, val);
+  }
+
+  uint8_t region = hue / 43;
+  uint8_t remainder = (hue - region * 43) * 6;
+
+  uint16_t p = (uint16_t)val * (255 - sat) / 255;
+  uint16_t q = (uint16_t)val * (255 - ((uint16_t)sat * remainder / 255)) / 255;
+  uint16_t t = (uint16_t)val * (255 - ((uint16_t)sat * (255 - remainder) / 255)) / 255;
+
+  switch (region) {
+    case 0: return RgbColor(val, (uint8_t)t, (uint8_t)p);
+    case 1: return RgbColor((uint8_t)q, val, (uint8_t)p);
+    case 2: return RgbColor((uint8_t)p, val, (uint8_t)t);
+    case 3: return RgbColor((uint8_t)p, (uint8_t)q, val);
+    case 4: return RgbColor((uint8_t)t, (uint8_t)p, val);
+    default: return RgbColor(val, (uint8_t)p, (uint8_t)q);
+  }
+}
+
+RgbColor HeatColor(uint8_t temperature) {
+  uint8_t heatramp = (temperature & 0x3F) << 2;
+  if (temperature > 0x80) {
+    return RgbColor(255, 255, heatramp);
+  } else if (temperature > 0x40) {
+    return RgbColor(255, heatramp, 0);
+  } else {
+    return RgbColor(heatramp, 0, 0);
+  }
+}
+
+uint8_t random8() {
+  return (uint8_t)random(0, 256);
+}
+
+uint8_t random8(uint8_t limit) {
+  return (uint8_t)random(0, limit);
+}
+
+uint8_t random8(uint8_t low, uint8_t high) {
+  return (uint8_t)random(low, high + 1);
+}
 
 void setup() {
   Serial.begin(115200);
@@ -50,11 +124,12 @@ void setup() {
 
   espClient.setCACert(ca_cert);
 
-  FastLED.addLeds<WS2812, DATA_PIN, GRB>(m_buffer, NUM_PIXELS);
-  FastLED.addLeds<WS2812, SYS_LED, RGB>(m_buffer, 1);
-  FastLED.clear();
-  
-  setColor(CRGB::White);
+  strip.Begin();
+  strip.SetBrightness(255);
+  strip.ClearTo(RgbColor(0, 0, 0));
+  strip.Show();
+
+  setColor(RgbColor(255, 255, 255));
 }
 
 void loop() {
@@ -64,33 +139,82 @@ void loop() {
     client.loop();
   }
 
-  if (strcmp(mode, "party") == 0) {
-    for (int i = 0; i < NUM_PIXELS; i++ ) {         // от 0 до первой трети
-      m_buffer[i] = CHSV(counter + i * 2, 255, 255);  // HSV. Увеличивать HUE (цвет)
-    // умножение i уменьшает шаг радууги
-    }
-    counter++;        // counter меняется от 0 до 255 (тип данных byte)
-    FastLED.show();
-    delay(5);
-  } else if (strcmp(mode, "neon") == 0) {
-    for (int i = 0; i < 256; i++) {
-      client.loop();
-      if (strcmp(mode, "neon") != 0) break;
-      FastLED.setBrightness(i);
-      FastLED.show();
-      delay(5);
-    }
-    for (int i = 255; i >= 0; i--) {
-      client.loop();
-      if (strcmp(mode, "neon") != 0) break;
-      FastLED.setBrightness(i);
-      FastLED.show();
-      delay(5);
-    }
-  } else if (strcmp(mode, "candle") == 0) {
-    
+  updateScene();
+}
+
+void setSceneMode(const char* newMode) {
+  if (strcmp(newMode, "party") == 0) {
+    sceneMode = SceneParty;
+    counter = 0;
+    neonBrightness = 0;
+    neonIncreasing = true;
+  } else if (strcmp(newMode, "neon") == 0) {
+    sceneMode = SceneNeon;
+    neonBrightness = 0;
+    neonIncreasing = true;
+    strip.SetBrightness(neonBrightness);
+    strip.Show();
+  } else if (strcmp(newMode, "candle") == 0) {
+    sceneMode = SceneCandle;
+  } else {
+    sceneMode = SceneNone;
   }
-  
+  strncpy(mode, newMode, sizeof(mode) - 1);
+  mode[sizeof(mode) - 1] = '\0';
+}
+
+void updateScene() {
+  unsigned long now = millis();
+  if (sceneMode == SceneNone || now - lastSceneUpdateMs < SCENE_UPDATE_INTERVAL_MS) {
+    return;
+  }
+  lastSceneUpdateMs = now;
+
+  switch (sceneMode) {
+    case SceneParty:
+      partyScene();
+      break;
+    case SceneNeon:
+      neonScene();
+      break;
+    case SceneCandle:
+      candleScene();
+      break;
+    default:
+      break;
+  }
+}
+
+void partyScene() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    uint8_t h = counter + i * 2;
+    strip.SetPixelColor(i, hsvToRgb(h, 255, 255));
+  }
+  counter++;
+  strip.Show();
+}
+
+void neonScene() {
+  if (neonIncreasing) {
+    if (neonBrightness < 255) {
+      neonBrightness++;
+    } else {
+      neonIncreasing = false;
+    }
+  } else {
+    if (neonBrightness > 0) {
+      neonBrightness--;
+    } else {
+      neonIncreasing = true;
+    }
+  }
+  strip.SetBrightness(neonBrightness);
+  strip.Show();
+}
+
+void candleScene() {
+  CandleScene();
+  strip.Show();
 }
 
 void setupMqtt() {
@@ -128,7 +252,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(command, "0") == 0) {
     mode[0] = '\0';
     digitalWrite(BUILTIN_LED, HIGH);
-    setColor(CRGB::Black);
+    setColor(RgbColor(0, 0, 0));
     return;
   }
 
@@ -141,7 +265,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
 
     mode[0] = '\0';
-    m_current.setRGB((uint8_t)r, (uint8_t)g, (uint8_t)b);
+    m_current = RgbColor((uint8_t)r, (uint8_t)g, (uint8_t)b);
     setColor(m_current);
     return;
   }
@@ -204,7 +328,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       }
     }
 
-    setColor(CRGB(red, green, blue));
+    setColor(RgbColor(red, green, blue));
     return;
   }
 
@@ -213,9 +337,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     if (pos + 1 < (int)length) {
       sscanf((const char*)payload + pos + 1, "%d", &brightness);
     }
-    FastLED.setBrightness(brightness);
-    FastLED.show();
-    FastLED.delay(25);
+    strip.SetBrightness((uint8_t)brightness);
+    strip.Show();
+    delay(25);
     return;
   }
 
@@ -229,17 +353,17 @@ void callback(char* topic, byte* payload, unsigned int length) {
       memcpy(mode, payload + pos + 1, sceneLen);
     }
     mode[sceneLen] = '\0';
+    setSceneMode(mode);
     return;
   }
 }
 
-void setColor(CRGB color) {
+void setColor(const RgbColor& color) {
   for (int i = 0; i < NUM_PIXELS; i++) {
-    m_buffer[i] = color; 
+    strip.SetPixelColor(i, color);
   }
-  
-  FastLED.show();
-  FastLED.delay(25); 
+  strip.Show();
+  delay(25);
 }
 
 bool reconnect() {
@@ -326,13 +450,13 @@ void CandleScene() {
  
     // Step 4.  Map from heat cells to LED colors
     for( int j = 0; j < NUM_PIXELS; j++) {
-      CRGB color = HeatColor( heat[j]);
+      RgbColor color = HeatColor( heat[j]);
       int pixelnumber;
-      if( false ) {
+      if (false) {
         pixelnumber = (NUM_PIXELS-1) - j;
       } else {
         pixelnumber = j;
       }
-      m_buffer[pixelnumber] = color;
+      strip.SetPixelColor(pixelnumber, color);
     }
 }
