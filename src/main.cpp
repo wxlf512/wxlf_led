@@ -137,12 +137,12 @@ void setup() {
   espClient.setCACert(ca_cert);
 
   strip.Begin();
-  strip.SetBrightness(255);
+  strip.SetBrightness(0);
   strip.ClearTo(RgbColor(0, 0, 0));
   strip.Show();
 #if ENABLE_SYS_LED
   sysLed.Begin();
-  sysLed.SetBrightness(255);
+  sysLed.SetBrightness(0);
   sysLed.ClearTo(RgbColor(0, 0, 0));
   sysLed.Show();
 #endif
