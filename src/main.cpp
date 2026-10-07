@@ -45,6 +45,8 @@ unsigned long lastReconnectTryMs = 0;
 const unsigned long RECONNECT_TIMEOUT_MS = 300000;
 const unsigned long RECONNECT_INTERVAL_MS = 5000;
 const unsigned long SCENE_UPDATE_INTERVAL_MS = 20;
+const unsigned long WIFI_CONNECT_BLINK_MS = 250;
+const unsigned long WIFI_CONNECTED_INDICATION_MS = 3000;
 
 void setupMqtt();
 void setupWebServer();
@@ -116,6 +118,13 @@ uint8_t random8(uint8_t low, uint8_t high) {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Initialize the strip before connecting so its first LED can show Wi-Fi status.
+  strip.Begin();
+  strip.SetBrightness(255);
+  strip.ClearTo(RgbColor(0, 0, 0));
+  strip.Show();
+
   WiFi.begin(ssid, wifiPass);
   Serial.print("connecting to ");
   Serial.print(ssid);
@@ -124,9 +133,19 @@ void setup() {
   setupMqtt();
 
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    strip.SetBrightness(1);
+    strip.SetPixelColor(1, RgbColor(255, 0, 0));
+    strip.Show();
+    delay(WIFI_CONNECT_BLINK_MS);
+    strip.SetPixelColor(1, RgbColor(0, 0, 0));
+    strip.Show();
+    delay(WIFI_CONNECT_BLINK_MS);
     Serial.print(".");
   }
+
+  strip.SetPixelColor(2, RgbColor(0, 255, 0));
+  strip.Show();
+  delay(WIFI_CONNECTED_INDICATION_MS);
   
   Serial.println('\n');
   Serial.println("connection estabilished");
@@ -136,7 +155,6 @@ void setup() {
   setupWebServer();
   espClient.setCACert(ca_cert);
 
-  strip.Begin();
   strip.SetBrightness(0);
   strip.ClearTo(RgbColor(0, 0, 0));
   strip.Show();
@@ -148,7 +166,7 @@ void setup() {
 #endif
   syncSysLed();
 
-  setColor(RgbColor(255, 255, 255));
+  setColor(RgbColor(0, 0, 0));
 }
 
 void loop() {
